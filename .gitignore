@@ -1,0 +1,13 @@
+wiki/
+sources/
+.compiled
+.clipped
+.aider*
+.obsidian/
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.env
+{sources,wiki,scripts}/
