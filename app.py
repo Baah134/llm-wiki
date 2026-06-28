@@ -236,17 +236,17 @@ HTML = r"""
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
   :root {
-    --bg:        #0f1117;
-    --surface:   #1a1d27;
-    --surface2:  #20243a;
-    --border:    #2a2d3a;
-    --accent:    #7c6aff;
-    --accent-dim:#3d3580;
-    --text:      #e2e4ef;
-    --muted:     #6b6f84;
-    --green:     #4ade80;
-    --yellow:    #fbbf24;
-    --red:       #f87171;
+    --bg:        #f7f8fc;
+    --surface:   #ffffff;
+    --surface2:  #eef0f8;
+    --border:    #dde0ee;
+    --accent:    #5b4ecc;
+    --accent-dim:#ebe8ff;
+    --text:      #1a1c2e;
+    --muted:     #8a8fa8;
+    --green:     #16a34a;
+    --yellow:    #d97706;
+    --red:       #dc2626;
     --mono:      'IBM Plex Mono', monospace;
     --sans:      'IBM Plex Sans', sans-serif;
   }
@@ -1201,16 +1201,175 @@ def compile_stream():
 
 @app.route("/insights")
 def insights_route():
-    """Run insights.py --json and return the result."""
-    import subprocess
+    """Run gap detection and source ranking directly — no subprocess."""
     try:
-        result = subprocess.run(
-            [sys.executable, str(BASE_DIR / "insights.py"), "--json"],
-            capture_output=True, text=True, timeout=120
-        )
-        data = json.loads(result.stdout)
-        return jsonify(data)
+        # ── Import insights functions directly ──
+        import re as _re
+        from pathlib import Path as _Path
+
+        wiki_dir    = BASE_DIR / "wiki"
+        sources_dir = BASE_DIR / "sources"
+        index_file  = wiki_dir / "INDEX.md"
+        compiled_log= BASE_DIR / ".compiled"
+
+        def _load_index():
+            return index_file.read_text(encoding="utf-8") if index_file.exists() else ""
+
+        def _load_pages():
+            pages = {}
+            for f in wiki_dir.glob("*.md"):
+                if f.name in ("INDEX.md", "CONFLICTS.md", "_raw_output.md"):
+                    continue
+                pages[f.stem] = f.read_text(encoding="utf-8", errors="replace")
+            return pages
+
+        def _load_sources():
+            compiled = set()
+            if compiled_log.exists():
+                compiled = set(compiled_log.read_text().splitlines())
+            sources = {}
+            for f in sources_dir.glob("*"):
+                if f.is_file() and f.suffix in {".txt", ".md"} and f.name in compiled:
+                    sources[f.name] = f.read_text(encoding="utf-8", errors="replace")
+            return sources
+
+        def _call(messages, max_tokens=1500):
+            for attempt in range(3):
+                try:
+                    resp = client.chat.completions.create(
+                        model=MODEL,
+                        messages=messages,
+                        temperature=0.3,
+                        top_p=0.95,
+                        max_tokens=max_tokens,
+                        extra_body={"chat_template_kwargs": {"thinking": False}},
+                        stream=False,
+                    )
+                    return resp.choices[0].message.content
+                except Exception as e:
+                    if attempt < 2:
+                        time.sleep(10)
+                    else:
+                        raise
+
+        pages      = _load_pages()
+        sources    = _load_sources()
+        wiki_index = _load_index()
+
+        # ── Gap detection ──
+        gaps = {"error": "Wiki is empty — compile some sources first."}
+        if pages:
+            all_links = set()
+            for content in pages.values():
+                all_links.update(_re.findall(r"\[\[([^\]]+)\]\]", content))
+
+            existing     = set(pages.keys())
+            orphan_links = sorted(all_links - existing - {"INDEX"})
+            page_lengths = {stem: len(c.split()) for stem, c in pages.items()}
+            thin_pages   = {s: wc for s, wc in page_lengths.items() if wc < 120}
+            page_summary = "\n".join(
+                f"- {s} ({wc} words)" for s, wc in sorted(page_lengths.items(), key=lambda x: -x[1])
+            )
+
+            raw = _call([
+                {"role": "system", "content": (
+                    "You are a knowledge curator analysing a personal wiki. "
+                    "Based on the wiki's current pages and index, identify:\n"
+                    "1. Important related topics completely missing\n"
+                    "2. Existing topics that need much more depth\n"
+                    "3. Specific sources the person should read next\n\n"
+                    "Format your response as:\n\n"
+                    "MISSING_TOPICS\n<bullet list>\nEND\n\n"
+                    "NEEDS_DEPTH\n<bullet list>\nEND\n\n"
+                    "SUGGESTED_READING\n<bullet list>\nEND"
+                )},
+                {"role": "user", "content": (
+                    f"## Wiki Index\n{wiki_index}\n\n"
+                    f"## All Pages\n{page_summary}\n\n"
+                    f"## Orphan Links\n" +
+                    ("\n".join(f"- {l}" for l in orphan_links) if orphan_links else "None")
+                )},
+            ])
+
+            def _section(text, tag):
+                m = _re.search(rf"{tag}\n(.*?)END", text, re.DOTALL)
+                if not m:
+                    return []
+                return [
+                    l.strip().lstrip("-•* ").strip()
+                    for l in m.group(1).strip().splitlines()
+                    if l.strip() and l.strip() not in ("-", "•", "*")
+                ]
+
+            gaps = {
+                "orphan_links":     orphan_links,
+                "thin_pages":       thin_pages,
+                "missing_topics":   _section(raw, "MISSING_TOPICS"),
+                "needs_depth":      _section(raw, "NEEDS_DEPTH"),
+                "suggested_reading":_section(raw, "SUGGESTED_READING"),
+                "page_count":       len(pages),
+                "total_words":      sum(page_lengths.values()),
+            }
+
+        # ── Source ranking ──
+        ranking = {"error": "No compiled sources found."}
+        if sources and pages:
+            scores = []
+            for name, src_content in sources.items():
+                citation_count = sum(
+                    1 for c in pages.values()
+                    if name in c or _Path(name).stem in c
+                )
+                links_in_src = len(_re.findall(r"\[\[([^\]]+)\]\]", src_content))
+                wc = len(src_content.split())
+                score = (citation_count * 10) + (links_in_src * 2) + min(wc // 100, 5)
+
+                title_m = _re.search(r"^#\s+(.+)$", src_content, re.MULTILINE)
+                title   = title_m.group(1).strip()[:60] if title_m else _Path(name).stem
+                url_m   = _re.search(r"\*\*Source URL:\*\*\s*(.+)", src_content)
+                url     = url_m.group(1).strip() if url_m else None
+
+                scores.append({
+                    "filename": name, "title": title, "url": url,
+                    "citation_count": citation_count,
+                    "word_count": wc, "score": score,
+                })
+
+            scores.sort(key=lambda x: -x["score"])
+
+            top = "\n".join(
+                f"{i+1}. {s['title']} (score:{s['score']}, cited by {s['citation_count']} pages)"
+                for i, s in enumerate(scores[:10])
+            )
+            low = "\n".join(
+                f"- {s['title']}" for s in scores if s["score"] == 0
+            )
+
+            insight = _call([
+                {"role": "system", "content": (
+                    "You are a knowledge curator. Given ranked sources and a wiki index, "
+                    "give brief qualitative insight in 3 short paragraphs:\n"
+                    "1. Why the top sources contributed most\n"
+                    "2. Why low-scoring sources added little\n"
+                    "3. One recommendation going forward"
+                )},
+                {"role": "user", "content": (
+                    f"## Wiki Index\n{wiki_index}\n\n"
+                    f"## Top Sources\n{top}\n\n"
+                    f"## Low/Zero Sources\n{low if low else 'None'}"
+                )},
+            ], max_tokens=600)
+
+            ranking = {
+                "ranked_sources": scores,
+                "insight":        insight,
+                "total_sources":  len(scores),
+            }
+
+        return jsonify({"gaps": gaps, "ranking": ranking})
+
     except Exception as e:
+        print(f"Insights error: {e}")
         return jsonify({"error": str(e)}), 500
 
 # ── Run ───────────────────────────────────────────────────────────────────────
