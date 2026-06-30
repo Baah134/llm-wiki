@@ -742,6 +742,7 @@ HTML = r"""
     <div class="tab-nav">
       <button class="tab-btn active" onclick="switchTab('chat')">Chat</button>
       <button class="tab-btn" onclick="switchTab('insights')">Insights</button>
+      <button class="tab-btn" onclick="switchTab('lint')">Lint</button>
     </div>
 
     <!-- Chat tab -->
@@ -782,6 +783,22 @@ HTML = r"""
           <span>Analysing your wiki... this takes ~30s</span>
         </div>
         <div id="insights-results" style="display:none; flex-direction:column; gap:20px;"></div>
+      </div>
+    </div>
+
+    <!-- Lint tab -->
+    <div class="tab-panel" id="tab-lint">
+      <div id="lint-panel">
+        <div class="insights-empty" id="lint-empty">
+          <h2>Wiki Lint</h2>
+          <p>Check your wiki for structural issues. Runs instantly — no API call needed.</p>
+          <button class="insight-run-btn" id="lint-run-btn" onclick="runLint()">Run Lint Check</button>
+        </div>
+        <div id="lint-loading" style="display:none; align-items:center; gap:8px; color:var(--muted); font-size:12px; font-family:var(--mono); padding:40px 0; justify-content:center;">
+          <div class="dot"></div><div class="dot"></div><div class="dot"></div>
+          <span>Scanning wiki...</span>
+        </div>
+        <div id="lint-results" style="display:none; flex-direction:column; gap:20px;"></div>
       </div>
     </div>
 
@@ -1023,10 +1040,15 @@ HTML = r"""
   // ── Tab switching ──
   function switchTab(tab) {
     document.querySelectorAll('.tab-btn').forEach((b, i) => {
-      b.classList.toggle('active', (i === 0 && tab === 'chat') || (i === 1 && tab === 'insights'));
+      b.classList.toggle('active',
+        (i === 0 && tab === 'chat') ||
+        (i === 1 && tab === 'insights') ||
+        (i === 2 && tab === 'lint')
+      );
     });
     document.getElementById('tab-chat').classList.toggle('active', tab === 'chat');
     document.getElementById('tab-insights').classList.toggle('active', tab === 'insights');
+    document.getElementById('tab-lint').classList.toggle('active', tab === 'lint');
   }
 
   // ── Insights ──
@@ -1131,6 +1153,110 @@ HTML = r"""
     sec.className = 'insight-section';
     sec.innerHTML = `<h3>${title}</h3>${isList ? '<ul class="insight-list">' + itemsHtml + '</ul>' : itemsHtml}`;
     return sec;
+  }
+
+  // ── Lint ──
+  async function runLint() {
+    document.getElementById('lint-empty').style.display   = 'none';
+    document.getElementById('lint-loading').style.display = 'flex';
+    document.getElementById('lint-results').style.display = 'none';
+    document.getElementById('lint-run-btn').disabled = true;
+
+    try {
+      const res  = await fetch('/lint');
+      const data = await res.json();
+
+      document.getElementById('lint-loading').style.display = 'none';
+
+      if (data.error) {
+        document.getElementById('lint-empty').style.display = 'block';
+        document.getElementById('lint-empty').querySelector('p').textContent = data.error;
+        document.getElementById('lint-run-btn').disabled = false;
+        return;
+      }
+
+      const results = document.getElementById('lint-results');
+      results.innerHTML = '';
+
+      const f = data.findings;
+      let totalIssues = 0;
+
+      // ── Auto-fixed ──
+      if (data.auto_fixed && data.auto_fixed.length) {
+        results.appendChild(insightSection(
+          `🔧 Auto-Fixed (${data.auto_fixed.length})`,
+          data.auto_fixed.map(p => `<li style="color:var(--green)">${escapeHtml(p)} — added to INDEX.md</li>`).join('')
+        ));
+      }
+
+      // ── Empty pages ──
+      if (f.empty_pages && f.empty_pages.length) {
+        totalIssues += f.empty_pages.length;
+        results.appendChild(insightSection(
+          `🗑️ Empty Pages (${f.empty_pages.length})`,
+          f.empty_pages.map(p => `<li>${escapeHtml(p)} <span style="color:var(--muted)">— no content, consider deleting</span></li>`).join('')
+        ));
+      }
+
+      // ── Missing sections ──
+      if (f.missing_sections && f.missing_sections.length) {
+        totalIssues += f.missing_sections.length;
+        results.appendChild(insightSection(
+          `📋 Missing Required Sections (${f.missing_sections.length})`,
+          f.missing_sections.map(item =>
+            `<li>${escapeHtml(item.page)} <span style="color:var(--muted)">— missing: ${escapeHtml(item.missing.join(', '))}</span></li>`
+          ).join('')
+        ));
+      }
+
+      // ── Orphan links ──
+      if (f.orphan_links && f.orphan_links.length) {
+        totalIssues += f.orphan_links.length;
+        results.appendChild(insightSection(
+          `🔗 Orphan Links — Referenced But No Page (${f.orphan_links.length})`,
+          f.orphan_links.map(l => `<li>[[${escapeHtml(l)}]]</li>`).join('')
+        ));
+      }
+
+      // ── Long pages ──
+      if (f.long_pages && f.long_pages.length) {
+        totalIssues += f.long_pages.length;
+        results.appendChild(insightSection(
+          `📏 Long Pages — Consider Summarising (${f.long_pages.length})`,
+          f.long_pages.map(item =>
+            `<li>${escapeHtml(item.page)} <span style="color:var(--muted)">(${item.words.toLocaleString()} words)</span></li>`
+          ).join('')
+        ));
+      }
+
+      // ── All clean ──
+      if (totalIssues === 0 && (!data.auto_fixed || !data.auto_fixed.length)) {
+        const clean = document.createElement('div');
+        clean.className = 'insights-empty';
+        clean.innerHTML = '<h2>✅ Wiki is clean</h2><p>No structural issues found.</p>';
+        results.appendChild(clean);
+      } else if (totalIssues > 0) {
+        const summary = document.createElement('div');
+        summary.style.cssText = 'font-family:var(--mono);font-size:11px;color:var(--muted);text-align:center;padding:8px 0;';
+        summary.textContent = `${totalIssues} issue(s) found — review above and fix manually or re-compile`;
+        results.appendChild(summary);
+      }
+
+      // Re-run button
+      const rerun = document.createElement('button');
+      rerun.className = 'insight-run-btn';
+      rerun.textContent = 'Re-run Lint';
+      rerun.onclick = runLint;
+      results.appendChild(rerun);
+
+      results.style.display = 'flex';
+
+    } catch(e) {
+      document.getElementById('lint-loading').style.display = 'none';
+      document.getElementById('lint-empty').style.display   = 'block';
+      document.getElementById('lint-empty').querySelector('p').textContent = 'Something went wrong. Check your terminal.';
+      document.getElementById('lint-run-btn').disabled = false;
+    }
   }
 
   loadStats();
@@ -1370,6 +1496,81 @@ def insights_route():
 
     except Exception as e:
         print(f"Insights error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/lint")
+def lint_route():
+    """Run lint check directly — no subprocess, no API call needed."""
+    try:
+        import re as _re
+        from pathlib import Path as _Path
+
+        wiki_dir   = BASE_DIR / "wiki"
+        index_file = wiki_dir / "INDEX.md"
+        skip       = {"INDEX.md", "CONFLICTS.md", "_raw_output.md"}
+        required   = ["## Summary", "## Key Details", "## Connections", "## Open Questions"]
+
+        pages = {f.name: f for f in wiki_dir.glob("*.md") if f.name not in skip}
+
+        if not pages:
+            return jsonify({"error": "Wiki is empty — compile some sources first."})
+
+        index_text = index_file.read_text(encoding="utf-8") if index_file.exists() else ""
+
+        findings = {
+            "missing_sections": [],
+            "orphan_links":     [],
+            "index_mismatches": [],
+            "empty_pages":      [],
+            "long_pages":       [],
+        }
+
+        # Collect all [[links]]
+        all_links = set()
+        for name, path in pages.items():
+            content_text = path.read_text(encoding="utf-8", errors="replace")
+            all_links.update(_re.findall(r"\[\[([^\]]+)\]\]", content_text))
+
+        existing_stems = {_Path(n).stem for n in pages}
+
+        for name, path in sorted(pages.items()):
+            content_text = path.read_text(encoding="utf-8", errors="replace")
+            word_count   = len(content_text.split())
+            stem         = path.stem
+
+            missing = [s for s in required if s not in content_text]
+            if missing:
+                findings["missing_sections"].append({"page": name, "missing": missing})
+
+            if word_count < 20:
+                findings["empty_pages"].append(name)
+
+            if word_count > 1000:
+                findings["long_pages"].append({"page": name, "words": word_count})
+
+            if stem not in index_text:
+                findings["index_mismatches"].append(name)
+
+        orphans = sorted(all_links - existing_stems - {"INDEX"})
+        findings["orphan_links"] = orphans
+
+        # Auto-fix: add missing pages to INDEX.md
+        auto_fixed = []
+        if findings["index_mismatches"] and index_file.exists():
+            idx_text   = index_file.read_text(encoding="utf-8")
+            additions  = []
+            for name in findings["index_mismatches"]:
+                stem = _Path(name).stem
+                additions.append(f"| [[{stem}]] | — | _(added by lint)_ |")
+                auto_fixed.append(name)
+            updated = idx_text.rstrip() + "\n" + "\n".join(additions) + "\n"
+            index_file.write_text(updated, encoding="utf-8")
+
+        return jsonify({"findings": findings, "auto_fixed": auto_fixed})
+
+    except Exception as e:
+        print(f"Lint error: {e}")
         return jsonify({"error": str(e)}), 500
 
 # ── Run ───────────────────────────────────────────────────────────────────────
